@@ -40,7 +40,10 @@ export const signup = async (req, res) => {
       role,
       createdAt: new Date().toISOString(),
       lastLoginAt: null,
-      loginCount: 0
+      loginCount: 0,
+      telegramId: null,
+      telegramUsername: null,
+      telegramLinkedAt: null
     };
 
     users.push(user);

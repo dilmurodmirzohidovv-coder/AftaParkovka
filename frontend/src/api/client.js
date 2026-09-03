@@ -1,4 +1,4 @@
-const API = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
+const API = import.meta.env.VITE_API_URL || 'https://aftaparkovka.onrender.com/api/v1';
 const TELEGRAM_BOT_USERNAME = import.meta.env.VITE_TELEGRAM_BOT_USERNAME || '';
 
 function getToken() {
@@ -53,4 +53,19 @@ export async function fetchMe() {
 
 export async function fetchAdminStats() {
   return request(`${API}/users/admin/stats`, { headers: { ...authHeaders() } });
+}
+
+export async function renameUserAdmin(id, name) {
+  return request(`${API}/users/admin/users/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ name })
+  });
+}
+
+export async function deleteUserAdmin(id) {
+  return request(`${API}/users/admin/users/${id}`, {
+    method: 'DELETE',
+    headers: { ...authHeaders() }
+  });
 }

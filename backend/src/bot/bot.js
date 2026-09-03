@@ -1,3 +1,4 @@
+import bcrypt from "bcryptjs";
 import TelegramBot from "node-telegram-bot-api";
 import {
   findParkingsByQuery,
@@ -10,10 +11,27 @@ import {
   getUserBookings,
   BOOKING_TTL_MINUTES
 } from "../models/bookingModel.js";
+import {
+  findUserByEmail,
+  findUserByTelegramId,
+  linkTelegram,
+  unlinkTelegram
+} from "../models/userModel.js";
 
-// Har bir chat uchun oxirgi qidiruv natijalarini saqlab turamiz,
-// shunda tugma bosilganda qaysi parkovka tanlanganini bilamiz.
-const sessions = new Map(); // chatId -> { parkings: [...] }
+// Har bir chat uchun holatni saqlaymiz: oxirgi qidiruv natijalari va
+// login jarayonining bosqichi (email so'ralyaptimi, parol so'ralyaptimi).
+const sessions = new Map(); // chatId -> { parkings, stage, pendingEmail }
+
+const getSession = (chatId) => {
+  if (!sessions.has(chatId)) sessions.set(chatId, {});
+  return sessions.get(chatId);
+};
+
+const resetAuthStage = (chatId) => {
+  const session = getSession(chatId);
+  session.stage = null;
+  session.pendingEmail = null;
+};
 
 const escapeMd = (text = "") =>
   String(text).replace(/([_*[\]()~`>#+\-=|{}.!])/g, "\\$1");
@@ -39,6 +57,42 @@ const lotMessage = (lot, index) => {
 
 const isFull = (lot) =>
   (lot.total || 0) > 0 && (lot.available == null ? false : lot.available <= 0);
+
+// --- Login gate ---
+// Qidiruvdan foydalanishdan oldin Telegram akkaunti saytdagi akkauntga
+// bog'langan bo'lishi kerak. Bog'lanmagan bo'lsa shu ekran chiqadi.
+
+const AUTH_GATE_KEYBOARD = {
+  inline_keyboard: [
+    [{ text: "🔑 Kirish", callback_data: "auth:login" }],
+    [{ text: "📝 Ro‘yxatdan o‘tish", callback_data: "auth:signup" }]
+  ]
+};
+
+async function sendAuthGate(bot, chatId, note) {
+  resetAuthStage(chatId);
+  const prefix = note ? `${note}\n\n` : "";
+  await bot.sendMessage(
+    chatId,
+    `${prefix}🔒 Qidirishdan oldin akkauntingizga kiring.\n\n` +
+      "Agar saytda ro‘yxatdan o‘tgan bo‘lsangiz — *Kirish* tugmasini bosing.\n" +
+      "Agar hali akkauntingiz bo‘lmasa — *Ro‘yxatdan o‘tish* tugmasini bosing.",
+    { parse_mode: "Markdown", reply_markup: AUTH_GATE_KEYBOARD }
+  );
+}
+
+function getLoggedInUser(fromId) {
+  return findUserByTelegramId(fromId);
+}
+
+// Har bir himoyalangan amaldan oldin chaqiriladi. Agar login qilinmagan
+// bo'lsa, login ekranini ko'rsatib false qaytaradi.
+async function requireLogin(bot, msg) {
+  const user = getLoggedInUser(msg.from.id);
+  if (user) return user;
+  await sendAuthGate(bot, msg.chat.id);
+  return null;
+}
 
 async function runSearch(bot, chatId, fetcher) {
   const waitMsg = await bot.sendMessage(chatId, "🔎 Qidirilmoqda...");
@@ -68,7 +122,7 @@ async function runSearch(bot, chatId, fetcher) {
   }
 
   const parkings = (result.parkings || []).slice(0, 6);
-  sessions.set(chatId, { parkings });
+  getSession(chatId).parkings = parkings;
 
   await bot.deleteMessage(chatId, waitMsg.message_id).catch(() => {});
 
@@ -111,45 +165,87 @@ export function startBot() {
     return null;
   }
 
+  const siteUrl = process.env.SITE_URL || "";
+
   const bot = new TelegramBot(token, { polling: true });
 
   bot.setMyCommands([
     { command: "start", description: "Botni boshlash" },
+    { command: "login", description: "Akkauntga kirish" },
+    { command: "logout", description: "Akkauntdan chiqish" },
     { command: "mybookings", description: "Mening band qilganlarim" },
     { command: "help", description: "Yordam" }
   ]);
 
-  bot.onText(/^\/start/, (msg) => {
-    sessions.delete(msg.chat.id);
-    bot.sendMessage(
-      msg.chat.id,
-      "🚗 *ParkTop botiga xush kelibsiz!*\n\n" +
-        "Manzil yozing (masalan: _Tashkent City_) yoki pastdagi tugma orqali " +
-        "joylashuvingizni yuboring — yaqin atrofdagi parkovkalarni topib beraman. " +
-        "Tanlagan parkovkangizni bitta tugma bosish bilan band qilasiz.",
-      {
-        parse_mode: "Markdown",
-        reply_markup: {
-          keyboard: [
-            [{ text: "📍 Joylashuvimni yuborish", request_location: true }]
-          ],
-          resize_keyboard: true
+  bot.onText(/^\/start/, async (msg) => {
+    const chatId = msg.chat.id;
+    sessions.set(chatId, {});
+
+    const user = getLoggedInUser(msg.from.id);
+
+    if (user) {
+      await bot.sendMessage(
+        chatId,
+        `🚗 *ParkTop botiga xush kelibsiz, ${escapeMd(user.name)}!*\n\n` +
+          "Manzil yozing (masalan: _Tashkent City_) yoki pastdagi tugma orqali " +
+          "joylashuvingizni yuboring — yaqin atrofdagi parkovkalarni topib beraman.",
+        {
+          parse_mode: "Markdown",
+          reply_markup: {
+            keyboard: [
+              [{ text: "📍 Joylashuvimni yuborish", request_location: true }]
+            ],
+            resize_keyboard: true
+          }
         }
-      }
+      );
+      return;
+    }
+
+    await sendAuthGate(
+      bot,
+      chatId,
+      "🚗 *ParkTop botiga xush kelibsiz!*"
     );
+  });
+
+  bot.onText(/^\/login/, async (msg) => {
+    const user = getLoggedInUser(msg.from.id);
+    if (user) {
+      return bot.sendMessage(msg.chat.id, `Siz allaqachon *${escapeMd(user.name)}* sifatida kirgansiz.`, {
+        parse_mode: "Markdown"
+      });
+    }
+    await sendAuthGate(bot, msg.chat.id);
+  });
+
+  bot.onText(/^\/logout/, (msg) => {
+    const chatId = msg.chat.id;
+    const user = getLoggedInUser(msg.from.id);
+    if (!user) {
+      return bot.sendMessage(chatId, "Siz hozir hech qanday akkauntga kirmagansiz.");
+    }
+    unlinkTelegram(msg.from.id);
+    sessions.set(chatId, {});
+    bot.sendMessage(chatId, "✅ Akkauntdan chiqdingiz. Qayta kirish uchun /login yuboring.");
   });
 
   bot.onText(/^\/help/, (msg) => {
     bot.sendMessage(
       msg.chat.id,
-      "Manzil yozing yoki joylashuvingizni yuboring. Ro‘yxatdan parkovkani tanlab, " +
+      "Qidirishdan oldin /login orqali saytdagi akkauntingizga kiring.\n\n" +
+        "Keyin manzil yozing yoki joylashuvingizni yuboring. Ro‘yxatdan parkovkani tanlab, " +
         "“✅ Band qilish” tugmasini bosing. Band qilish taxminan " +
         `${BOOKING_TTL_MINUTES} daqiqa davomida saqlanadi.\n\n` +
-        "/mybookings — hozirgi band qilishlaringizni ko‘rish"
+        "/mybookings — hozirgi band qilishlaringizni ko‘rish\n" +
+        "/logout — akkauntdan chiqish"
     );
   });
 
-  bot.onText(/^\/mybookings/, (msg) => {
+  bot.onText(/^\/mybookings/, async (msg) => {
+    const user = await requireLogin(bot, msg);
+    if (!user) return;
+
     const list = getUserBookings(msg.from.id);
 
     if (!list.length) {
@@ -176,6 +272,9 @@ export function startBot() {
   });
 
   bot.on("location", async (msg) => {
+    const user = await requireLogin(bot, msg);
+    if (!user) return;
+
     const { latitude, longitude } = msg.location;
     await runSearch(bot, msg.chat.id, async () => {
       const place = await reverseGeocode(latitude, longitude);
@@ -185,7 +284,75 @@ export function startBot() {
 
   bot.on("message", async (msg) => {
     if (!msg.text || msg.text.startsWith("/") || msg.location) return;
-    await runSearch(bot, msg.chat.id, () => findParkingsByQuery(msg.text.trim()));
+
+    const chatId = msg.chat.id;
+    const session = getSession(chatId);
+
+    // --- Login jarayoni davom etayotgan bo'lsa, matnni shu yerda ishlaymiz ---
+    if (session.stage === "await_email") {
+      const email = msg.text.trim().toLowerCase();
+
+      if (!email.includes("@") || !email.includes(".")) {
+        return bot.sendMessage(chatId, "Email noto‘g‘ri ko‘rinyapti. Qaytadan kiriting:");
+      }
+
+      const existing = findUserByEmail(email);
+      if (!existing) {
+        resetAuthStage(chatId);
+        return sendAuthGate(
+          bot,
+          chatId,
+          "Bunday email bilan akkaunt topilmadi. Avval saytda ro‘yxatdan o‘ting."
+        );
+      }
+
+      session.pendingEmail = email;
+      session.stage = "await_password";
+      return bot.sendMessage(chatId, "🔑 Endi parolingizni yuboring:");
+    }
+
+    if (session.stage === "await_password") {
+      const password = msg.text;
+      const email = session.pendingEmail;
+
+      // Maxfiylik uchun parol yozilgan xabarni chatdan o'chirib yuboramiz.
+      bot.deleteMessage(chatId, msg.message_id).catch(() => {});
+
+      const user = findUserByEmail(email);
+      const validPassword =
+        user && (await bcrypt.compare(password, user.password).catch(() => false));
+
+      if (!user || !validPassword) {
+        resetAuthStage(chatId);
+        await bot.sendMessage(chatId, "❌ Email yoki parol noto‘g‘ri. Qaytadan urinib ko‘ring: /login");
+        return;
+      }
+
+      linkTelegram(user.id, msg.from.id, { username: msg.from.username });
+      resetAuthStage(chatId);
+
+      await bot.sendMessage(
+        chatId,
+        `✅ *Xush kelibsiz, ${escapeMd(user.name)}!* Akkauntingiz shu Telegram bilan bog‘landi.\n\n` +
+          "Endi manzil yozing yoki joylashuvingizni yuboring.",
+        {
+          parse_mode: "Markdown",
+          reply_markup: {
+            keyboard: [
+              [{ text: "📍 Joylashuvimni yuborish", request_location: true }]
+            ],
+            resize_keyboard: true
+          }
+        }
+      );
+      return;
+    }
+
+    // --- Login qilingan bo'lsa, matn qidiruv so'rovi sifatida ishlanadi ---
+    const user = await requireLogin(bot, msg);
+    if (!user) return;
+
+    await runSearch(bot, chatId, () => findParkingsByQuery(msg.text.trim()));
   });
 
   bot.on("callback_query", async (query) => {
@@ -196,10 +363,37 @@ export function startBot() {
       return bot.answerCallbackQuery(query.id);
     }
 
+    if (data === "auth:login") {
+      await bot.answerCallbackQuery(query.id);
+      const session = getSession(chatId);
+      session.stage = "await_email";
+      session.pendingEmail = null;
+      return bot.sendMessage(chatId, "📧 Saytda ro‘yxatdan o‘tgan emailingizni yuboring:");
+    }
+
+    if (data === "auth:signup") {
+      await bot.answerCallbackQuery(query.id);
+      const link = siteUrl ? `\n\n${siteUrl}` : "";
+      return bot.sendMessage(
+        chatId,
+        "Saytda hali akkauntingiz yo‘q ekan. Avval saytga kirib ro‘yxatdan o‘ting, " +
+          `so‘ng shu yerga qaytib /login yuboring.${link}`
+      );
+    }
+
     if (data.startsWith("book:")) {
+      const user = getLoggedInUser(query.from.id);
+      if (!user) {
+        await bot.answerCallbackQuery(query.id, {
+          text: "Avval akkauntingizga kiring: /login",
+          show_alert: true
+        });
+        return sendAuthGate(bot, chatId);
+      }
+
       const index = Number(data.slice(5));
-      const session = sessions.get(chatId);
-      const lot = session?.parkings?.[index];
+      const session = getSession(chatId);
+      const lot = session.parkings?.[index];
 
       if (!lot) {
         return bot.answerCallbackQuery(query.id, {
