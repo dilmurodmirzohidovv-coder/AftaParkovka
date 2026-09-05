@@ -1,4 +1,4 @@
-const API = import.meta.env.VITE_API_URL || 'https://aftaparkovka.onrender.com/api/v1';
+const API = import.meta.env.VITE_API_URL || 'https://aftaparkovka.onrender.com';
 const TELEGRAM_BOT_USERNAME = import.meta.env.VITE_TELEGRAM_BOT_USERNAME || '';
 
 function getToken() {
